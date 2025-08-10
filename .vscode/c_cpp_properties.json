@@ -9,6 +9,7 @@
       "cppStandard": "c++23",       // <-- C++ standard
       "includePath": [
         "${workspaceFolder}/**",
+        "${workspaceFolder}/thirdparty/dist/boost_1_88_0/include"
       ],
       "defines": [
         "BOOST_ASIO_HAS_CO_AWAIT",
