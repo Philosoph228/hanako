@@ -1,0 +1,19 @@
+{
+  "version": 4,
+  "configurations": [
+    {
+      "name": "Linux-Clang19",
+      "compilerPath": "/usr/bin/clang++-19",
+      "intelliSenseMode": "linux-clang-x64",
+      "cStandard": "c99",           // <-- C standard
+      "cppStandard": "c++23",       // <-- C++ standard
+      "includePath": [
+        "${workspaceFolder}/**",
+      ],
+      "defines": [
+        "BOOST_ASIO_HAS_CO_AWAIT",
+        "__cpp_impl_coroutine=201902"  // helps IntelliSense recognize coroutines
+      ]
+    }
+  ]
+}

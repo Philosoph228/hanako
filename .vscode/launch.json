@@ -1,0 +1,20 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Remote launch",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/hanako", // optional but helps resolve breakpoints early
+      "initCommands": [
+        "platform select remote-linux",
+        "platform connect connect://localhost:12345",
+        "settings set target.inherit-env false", // See note below.
+      ],
+      "env": {
+        "WAIT_FOR_DEBUGGER": "1", // See note below.
+      },
+      "preLaunchTask": "Build (via build.sh)"
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build (via build.sh)",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/build.sh",
+      "args": [],
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "start-lldb-server",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/start-lldb-server.sh",
+      "args": [
+        "${workspaceFolder}/build/hanako"
+      ],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      },
+      "problemMatcher": []
+    }
+  ]
+}
