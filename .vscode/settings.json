@@ -68,6 +68,9 @@
         "cinttypes": "cpp",
         "variant": "cpp",
         "format": "cpp",
-        "stdfloat": "cpp"
+        "stdfloat": "cpp",
+        "strstream": "cpp",
+        "complex": "cpp",
+        "fstream": "cpp"
     }
 }
