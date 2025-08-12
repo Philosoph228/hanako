@@ -3,6 +3,8 @@
 #include <vector>
 #include <thread>
 #include <chrono>
+#include <fstream>
+#include <sstream>
 
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
@@ -11,6 +13,10 @@
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/system/error_code.hpp>
 #include <boost/asio/experimental/awaitable_operators.hpp>
+#include <numeric>
+#include <ranges>
+#include <regex>
+#include <unordered_set>
 
 namespace net = boost::asio;
 namespace ssl = net::ssl;
@@ -23,6 +29,15 @@ using namespace net::experimental::awaitable_operators;
 static constexpr char const* DEFAULT_UPSTREAM_ADDR = "1.1.1.1";
 static constexpr unsigned short DEFAULT_UPSTREAM_PORT = 53;
 static constexpr auto UPSTREAM_TIMEOUT = 3s;    // wait up to 3 seconds for UPD reply
+
+struct dns_header {
+    uint16_t id;
+    uint16_t flags;
+    uint16_t qdcount;
+    uint16_t ancount;
+    uint16_t nscount;
+    uint16_t arcount;
+};
 
 // Read exactly N bytes from stream into buffer
 net::awaitable<void> async_read_exact(ssl::stream<tcp::socket>& s, net::mutable_buffer buf) {
@@ -88,6 +103,152 @@ forward_to_upstream(net::any_io_executor ex,
     }
 }
 
+// Parse a domain name from `msg` (length msg_len).
+// `offset` is updated to the position *after* the name (unless a jump/pointer is used
+// - in that case the offset is advanced by 2 where the pointer was encountered).
+// On success returns true and sets `out_name`.
+bool parse_name(const uint8_t* msg, size_t msg_len, size_t& offset, std::string& out_name)
+{
+    out_name.clear();
+    if (offset >= msg_len) return false;
+
+    size_t cur = offset;
+    bool jumped = false;
+    const size_t max_jumps = 128;   // avoid infinite loops
+    size_t jumps = 0;
+
+    while (true) {
+        if (cur >= msg_len) return false;
+        uint8_t len = msg[cur];
+
+        // Pointer: two high bits set
+        if ((len & 0xC0) == 0xC0) {
+            if (cur + 1 >= msg_len) return false;
+            uint16_t ptr = ((uint16_t)(len & 0x3F) << 8) | msg[cur + 1];
+            if (ptr >= msg_len) return false; // sanity
+            if (!jumped) {
+                // advance original offset by 2 (pointer takes two bytes)
+                offset = cur + 2;
+            }
+            cur = ptr;
+            jumped = true;
+
+            if (++jumps > max_jumps) return false;
+            continue;
+        }
+
+        // End of name
+        if (len == 0) {
+            if (!jumped) {
+                offset = cur + 1; // skip the 0 byte
+            }
+            break;
+        }
+
+        // Label
+        if (cur + 1 + len > msg_len) return false; // OOB
+        cur++; // move to label bytes
+        if (!out_name.empty()) out_name.push_back('.');
+        out_name.append(reinterpret_cast<const char*>(msg + cur), len);
+        cur += len;
+        if (!jumped) {
+            offset = cur; // update offset to after this label
+        }
+    }
+
+    return true;
+}
+
+using ipv4_t = std::array<uint8_t, 4>;
+
+// hasher for ipv4_t
+struct ipv4_hasher {
+    std::size_t operator()(ipv4_t const& a) const noexcept {
+        // pack into uint32_t in network order (big-endian) for hashing
+        uint32_t v = (uint32_t(a[0]) << 24) | (uint32_t(a[1]) << 16) |
+                     (uint32_t(a[2]) << 8) | (uint32_t(a[3]));
+        return std::hash<uint32_t>{}(v);
+    }
+};
+
+static std::string ipv4_to_string(ipv4_t const& ip) {
+    std::ostringstream ss;
+    ss << unsigned(ip[0]) << '.' << unsigned(ip[1]) << '.'
+       << unsigned(ip[2]) << '.' << unsigned(ip[3]);
+    return ss.str();
+}
+
+static ipv4_t ipv4_from_bytes(const uint8_t* b) noexcept {
+    return ipv4_t{ b[0], b[1], b[2], b[3] };
+}
+
+static std::mutex g_cache_mutex;
+static std::unordered_map<std::string, std::unordered_set<ipv4_t, ipv4_hasher>> g_a_cache;
+static std::vector<std::regex> g_watch_patterns;    // Compiled at startup
+
+// returns IPv4 addresses as dotted strings found in the ANSWER section
+static std::vector<ipv4_t> extract_a_records(const std::vector<uint8_t>& resp) {
+    std::vector<ipv4_t> out;
+    if (resp.size() < sizeof(dns_header)) return out;
+
+    dns_header hdr;
+    std::memcpy(&hdr, resp.data(), sizeof(hdr));
+    uint16_t ancount = ntohs(hdr.ancount);
+    uint16_t qdcount = ntohs(hdr.qdcount);
+
+    const uint8_t* msg = resp.data();
+    size_t msg_len = resp.size();
+    size_t offset = sizeof(dns_header);
+
+    // skip questions
+    for (uint16_t q = 0; q < qdcount; ++q) {
+        std::string tmp;
+        if (!parse_name(msg, msg_len, offset, tmp)) return out;
+        if (offset + 4 > msg_len) return out;
+        offset += 4;
+    }
+
+    // parse answers
+    for (uint16_t a = 0; a < ancount; ++a) {
+        std::string aname;
+        if (!parse_name(msg, msg_len, offset, aname)) return out;
+        if (offset + 10 > msg_len) return out;
+
+        uint16_t atype = (uint16_t(msg[offset]) << 8) | uint16_t(msg[offset + 1]);
+        uint16_t rdlen = (uint16_t(msg[offset + 8]) << 8) | uint16_t(msg[offset + 9]);
+        offset += 10;
+
+        if (offset + rdlen > msg_len) return out;
+
+        if (atype == 1 && rdlen == 4) { // A record
+            out.push_back(ipv4_from_bytes(msg + offset));
+        }
+
+        offset += rdlen;
+    }
+
+    return out;
+}
+
+inline bool match_any_watchlist(std::string_view qname) {
+    if (g_watch_patterns.empty()) return false;
+    std::string s(qname);   // std::regex APIs take string/char*
+    for (auto const& re : g_watch_patterns) {
+        if (std::regex_match(s, re)) return true;
+    }
+    return false;
+}
+
+static std::string canonicalize_qname(std::string_view q) {
+    std::string s(q);
+    // lower-case (DNS is case-insensitive)
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c){ return std::tolower(c); });
+    // optionally strip trailing dot
+    if (!s.empty() && s.back() == '.') s.pop_back();
+    return s;
+}
+
 net::awaitable<void> handle_tls_session(ssl::stream<tcp::socket> stream,
                                         const std::string& upstream_addr,
                                         unsigned short upstream_port) {
@@ -117,7 +278,57 @@ net::awaitable<void> handle_tls_session(ssl::stream<tcp::socket> stream,
             std::vector<uint8_t> query(qlen);
             co_await async_read_exact(*s, net::buffer(query.data(), qlen));
 
-            // Forward to upstream UDP resolver (simple behavior)
+            // Safely copy header to avoid alignment/aliasing UB
+            if (query.size() < sizeof(dns_header)) {
+                std::cerr << "  truncated packet (no header)\n";
+                break;
+            }
+
+            dns_header hdr;
+            std::memcpy(&hdr, query.data(), sizeof(hdr));
+            uint16_t packet_id = ntohs(hdr.id);
+            uint16_t query_count = ntohs(hdr.qdcount);
+
+            std::cout << "Packet ID: " << packet_id << "\n";
+            std::cout << "Question count: " << query_count << "\n";
+
+            const uint8_t* msg = query.data();
+            size_t msg_len = query.size();
+            size_t offset = sizeof(dns_header);
+
+            // per-request matched names (canonicalized)
+            std::vector<std::string> matched_names;
+
+            uint16_t to_parse = std::min<uint16_t>(query_count, 256);
+            for (uint16_t i = 0; i < to_parse; ++i) {
+                std::cout << "Query #" << i << ":\n";
+
+                std::string qname;
+                if (!parse_name(msg, msg_len, offset, qname)) {
+                    std::cerr << "  failed to parse name at question " << i << "\n";
+                    goto close_session;
+                }
+
+                if (offset + 4 > msg_len) {
+                    std::cerr << "  truncated question (missing QTYPE/QCLASS)\n";
+                    goto close_session;
+                }
+
+                uint16_t qtype = (uint16_t(msg[offset]) << 8) | uint16_t(msg[offset + 1]);
+                uint16_t qclass = (uint16_t(msg[offset + 2]) << 8) | uint16_t(msg[offset + 3]);
+                offset += 4;
+
+                // canonicalize and test against watchlist (fast: precompiled regexes)
+                std::string qcanon = canonicalize_qname(qname);
+                if (match_any_watchlist(qcanon)) {
+                    matched_names.push_back(qcanon);
+                }
+
+                std::cout << "  Name : " << qname << "\n";
+                std::cout << "  QTYPE: " << qtype << "  QCLASS: " << qclass << "\n";
+            }
+            
+            // Forward to upstream
             auto upstream_resp = co_await forward_to_upstream(ex, query, upstream_addr, upstream_port);
 
             if (upstream_resp.empty()) {
@@ -125,6 +336,25 @@ net::awaitable<void> handle_tls_session(ssl::stream<tcp::socket> stream,
                 // For simplicity here, close connection.
                 std::cerr << "[DoT] upstream timeout or error - closing session\n";
                 break;
+            }
+
+            // Parse A records as 4-byte blobs (ipv4_t = std::array<uint8_t, 4>)
+            auto a_ips = extract_a_records(upstream_resp);
+
+            // Insert into global cache (thread-safe)
+            // only if we have matches and A records
+            if (!a_ips.empty() && !matched_names.empty()) {
+                std::scoped_lock lock(g_cache_mutex);   // C++17/C++23 scoped lock
+                for (auto const& name : matched_names) {
+                    auto &set_ref = g_a_cache[name];    // default-constructs unordered_set if needed
+                    for (auto const& ip : a_ips) {
+                        auto [it, inserted] = set_ref.insert(ip);
+                        if (inserted) {
+                            std::cout << "[cache] inserted " << ipv4_to_string(ip)
+                                      << " for " << name << '\n';
+                        }
+                    }
+                }
             }
 
             // send back framed response: 2-byte length + payload
@@ -139,6 +369,9 @@ net::awaitable<void> handle_tls_session(ssl::stream<tcp::socket> stream,
             std::size_t written = co_await net::async_write(*s, net::buffer(out), use_awaitable);
             (void)written;
         }
+
+close_session:
+        ;
     }
     catch (const std::exception& e) {
         // connection-level error (client disconnects, etc.)
@@ -147,9 +380,76 @@ net::awaitable<void> handle_tls_session(ssl::stream<tcp::socket> stream,
     // socket closes when shared_ptr goes out of scope
 }
 
+// Parse newline-separated patterns. LInes starting with '#' or empty are ignored.
+// Throws std::regex_error on invalid regex (with message including line).
+std::vector<std::regex>
+compile_regex_list(
+    std::string_view patterns_text,
+    std::regex_constants::syntax_option_type opts =
+        std::regex_constants::ECMAScript |
+        std::regex_constants::icase |
+        std::regex_constants::optimize)
+{
+    std::vector<std::regex> out;
+    std::string line;
+    std::istringstream ss{std::string(patterns_text)};  // copy -> istringstream
+    size_t lineno = 0;
+    while (std::getline(ss, line)) {
+        ++lineno;
+        // trim whitespace (simple)
+        auto first = line.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) continue;
+        auto last = line.find_last_not_of(" \t\r\n");
+        std::string_view trimmed(line.c_str() + first, last - first + 1);
+
+        if (trimmed.empty() || trimmed.front() == '#') continue;
+
+        try {
+            // construct std::regex from std::string to avoid any string_view overload issues
+            out.emplace_back(std::string(trimmed), opts);
+        }
+        catch (const std::regex_error& ex) {
+            std::ostringstream e;
+            e << "regex compile error on line " << lineno << ": " << ex.what()
+              << " (pattern: \"" << std::string(trimmed) << "\")";
+            throw std::runtime_error(e.str());
+        }
+    }
+    return out;
+}
+
+// Load from file convenience
+std::vector<std::regex>
+compile_regex_list_from_file(
+    std::string_view path,
+    std::regex_constants::syntax_option_type opts =
+        std::regex_constants::ECMAScript |
+        std::regex_constants::icase |
+        std::regex_constants::optimize) {
+    std::ifstream ifs{ std::string(path) };
+    if (!ifs) throw std::runtime_error("cannot open regex file");
+    std::ostringstream buf;
+    buf << ifs.rdbuf();
+    return compile_regex_list(buf.str(), opts);
+}
+
 int main(int argc, char** argv)
 {
     std::cout << "hanako started" << std::endl;
+
+    const std::string regex_list_text = R"(# domains to monitor
+^.*\.?google\.com$
+^.*\.?openai\.com$
+^.*\.?chatgpt\.com$)";
+
+    try {
+        g_watch_patterns = compile_regex_list(regex_list_text);
+    }
+    catch (const std::exception& e) {
+        std::cerr << "Failed to compile regex list: " << e.what() << '\n';
+        std::exit(1);
+    }
+
     try {
         std::string upstream_addr = DEFAULT_UPSTREAM_ADDR;
         unsigned short upstream_port = DEFAULT_UPSTREAM_PORT;
