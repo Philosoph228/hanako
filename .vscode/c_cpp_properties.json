@@ -10,7 +10,8 @@
       "includePath": [
         "${workspaceFolder}/**",
         "${workspaceFolder}/thirdparty/dist/boost_1_88_0/include",
-        "${workspaceFolder}/thirdparty/dist/openssl-1.1.1w/include"
+        "${workspaceFolder}/thirdparty/dist/openssl-1.1.1w/include",
+        "/usr/include/libnl3"
       ],
       "defines": [
         "BOOST_ASIO_HAS_CO_AWAIT",

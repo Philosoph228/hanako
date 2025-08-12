@@ -18,6 +18,12 @@
 #include <regex>
 #include <unordered_set>
 
+#include <netlink/netlink.h>
+#include <netlink/route/route.h>
+#include <netlink/route/rule.h>
+#include <netlink/route/link.h>
+#include <netlink/addr.h>
+
 namespace net = boost::asio;
 namespace ssl = net::ssl;
 using tcp = net::ip::tcp;
@@ -38,6 +44,164 @@ struct dns_header {
     uint16_t nscount;
     uint16_t arcount;
 };
+
+// Trim helpers
+inline std::string_view trim_view(std::string_view v) {
+    size_t start = 0;
+    while (start < v.size() && std::isspace(static_cast<unsigned char>(v[start]))) ++start;
+    size_t end = v.size();
+    while (end > start && std::isspace(static_cast<unsigned char>(v[end - 1]))) --end;
+    return v.substr(start, end - start);
+}
+
+// Native libnl route add/replace: <dst_with_prefix> e.g. "203.0.113.5/32"
+int add_host_route_libnl(std::string const& dst_with_prefix, std::string const& ifname, int table) {
+    struct nl_sock *sock = nl_socket_alloc();
+    if (!sock) return -1;
+    if (nl_connect(sock, NETLINK_ROUTE) < 0) {
+        std::cerr << "nl_connect failed\n";
+        nl_socket_free(sock);
+        return -1;
+    }
+
+    struct rtnl_route* route = rtnl_route_alloc();
+    if (!route) {
+        std::cerr << "rtnl_route_alloc failed\n";
+        nl_socket_free(sock);
+        return -1;
+    }
+
+    // Set address family to IPv4
+    rtnl_route_set_family(route, AF_INET);
+    rtnl_route_set_table(route, table);
+    rtnl_route_set_scope(route, RT_SCOPE_UNIVERSE);
+    rtnl_route_set_type(route, RTN_UNICAST);    // typical
+
+    // Set destination (expects "1.2.3.4/32")
+    struct nl_addr *dst = nullptr;
+    if (nl_addr_parse(dst_with_prefix.c_str(), AF_INET, &dst) < 0) {
+        std::cerr << "nl_addr_parse failed for " << dst_with_prefix << '\n';
+        nl_object_put(reinterpret_cast<nl_object*>(route));
+        nl_socket_free(sock);
+        return -1;
+    }
+    rtnl_route_set_dst(route, dst);
+    nl_addr_put(dst);   // route has internal ref
+
+
+    // 2)
+
+    unsigned int ifindex = if_nametoindex(ifname.c_str());
+    if (ifindex == 0) {
+        std::cerr << "interface not found: " << ifname << '\n';
+        nl_object_put(reinterpret_cast<nl_object*>(route));
+        nl_socket_free(sock);
+        return -1;
+    }
+    struct rtnl_nexthop *nh = rtnl_route_nh_alloc();
+    rtnl_route_nh_set_ifindex(nh, ifindex);
+    rtnl_route_add_nexthop(route, nh);
+
+    int flags = NLM_F_CREATE | NLM_F_REPLACE;
+    int err = rtnl_route_add(sock, route, flags);
+    if (err < 0) {
+        std::cerr << "rtnl_route_add failed: " << nl_geterror(err) << '\n';
+    }
+    else {
+        std::cerr << "route added/replaced" << dst_with_prefix << " dev " << ifname << " table " << table << '\n';
+    }
+
+    nl_object_put(reinterpret_cast<nl_object*>(route));
+    nl_socket_free(sock);
+    return err;
+}
+
+int add_fwmark_rule_libnl(uint32_t fwmark, uint32_t table_id) {
+    struct nl_sock *sk = nl_socket_alloc();
+    if (!sk) return -1;
+    if (nl_connect(sk, NETLINK_ROUTE) < 0) {
+        nl_socket_free(sk);
+        return -1;
+    }
+
+    struct rtnl_rule *rule = rtnl_rule_alloc();
+    if (!rule) {
+        nl_socket_free(sk);
+        return -1;
+    }
+
+    rtnl_rule_set_family(rule, AF_INET);    // IPv4 policy
+    rtnl_rule_set_table(rule, table_id);    // numeric table id
+    rtnl_rule_set_mark(rule, fwmark);       // match fwmark
+    // optional: mask (if you want to match bits only)
+    // rtnl_rule_set_mask(rule, 0xFFFFFFFF);
+
+    // CREATE|EXCL will create only if missing; use CREATE|REPLACE to replace
+    int flags = NLM_F_CREATE | NLM_F_EXCL;
+    int err = rtnl_rule_add(sk, rule, flags);
+    if (err < 0) {
+        // if it already exists, you might get -NLE_EXIST, handle as needed
+        std::cerr << "rtnl_rule_add: " << nl_geterror(err) << "\n";
+    }
+
+    nl_object_put(reinterpret_cast<nl_object*>(rule));
+    nl_socket_free(sk);
+    return err;
+}
+
+int delete_to_rules_for_table(int target_table) {
+    struct nl_sock *sk = nl_socket_alloc();
+    if (!sk) return -1;
+    if (nl_connect(sk, NETLINK_ROUTE) < 0) {
+        nl_socket_free(sk);
+        return -1;
+    }
+
+    struct nl_cache *cache = nullptr;
+    if (rtnl_rule_alloc_cache(sk, AF_INET, &cache) < 0) {
+        nl_socket_free(sk);
+        return -1;
+    }
+
+    struct nl_object *obj;
+    for (obj = nl_cache_get_first(cache); obj != nullptr; obj = nl_cache_get_next(obj)) {
+        struct rtnl_rule *r = (struct rtnl_rule*) obj;
+        uint32_t table = rtnl_rule_get_table(r);
+        if (table != (uint32_t)target_table) continue;
+
+        struct nl_addr* dst = rtnl_rule_get_dst(r);
+        if (!dst) continue; // not a "to" rule
+
+        // if it's a to <ip> lookup target_table, delete it
+        // make a template rule object describing the same rule to delete
+        struct rtnl_rule *tmpl = rtnl_rule_alloc();
+        if (!tmpl) continue;
+        // copy relevant fields: family, table, dst
+        rtnl_rule_set_family(tmpl, rtnl_rule_get_family(r));
+        rtnl_rule_set_table(tmpl, table);
+        // set dst - note rtnl_rule_set_dst takes ownership of addr pointer,
+        // so clone it via nl_addr_clone() or parse new one from string
+        char buf[128];
+        nl_addr2str(dst, buf, sizeof(buf));
+        struct nl_addr *dstcopy = nullptr;
+        nl_addr_parse(buf, AF_INET, &dstcopy);
+        rtnl_rule_set_dst(tmpl, dstcopy);
+        nl_addr_put(dstcopy);   // tmpl has internal ref
+
+        int err = rtnl_rule_delete(sk, tmpl, 0);
+        if (err < 0) {
+            std::cerr << "rtnl_rule_delete: " << nl_geterror(err) << "\n";
+        }
+        else {
+            std::cerr << "Deleted rule to " << buf << " lookup " << target_table << "\n";
+        }
+        nl_object_put(reinterpret_cast<nl_object*>(tmpl));
+    }
+
+    nl_cache_free(cache);
+    nl_socket_free(sk);
+    return 0;
+}
 
 // Read exactly N bytes from stream into buffer
 net::awaitable<void> async_read_exact(ssl::stream<tcp::socket>& s, net::mutable_buffer buf) {
